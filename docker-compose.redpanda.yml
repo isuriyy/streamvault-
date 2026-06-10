@@ -1,0 +1,91 @@
+# StreamVault — Redpanda stack
+# Isolated on its own network (redpanda_net) — won't touch existing Docker projects.
+#
+# Commands:
+#   Start broker + console:
+#     docker compose -f docker-compose.redpanda.yml up -d
+#
+#   Create topics (run once):
+#     docker compose -f docker-compose.redpanda.yml run --rm producer create_topics.py
+#
+#   Run replay producer:
+#     docker compose -f docker-compose.redpanda.yml run --rm producer producer.py --data-dir /data/raw --delay 0.05
+#
+#   Stop everything:
+#     docker compose -f docker-compose.redpanda.yml down
+#
+#   Stop + wipe data:
+#     docker compose -f docker-compose.redpanda.yml down -v
+
+networks:
+  redpanda_net:
+    driver: bridge
+
+volumes:
+  redpanda_data:
+
+services:
+
+  # ── Redpanda broker ──────────────────────────────────────────────────────────
+  redpanda:
+    image: redpandadata/redpanda:latest
+    container_name: olist_redpanda
+    networks:
+      - redpanda_net
+    ports:
+      - "9092:9092"       # Kafka API (internal)
+      - "9644:9644"       # Admin API → used by Console
+      - "19092:19092"     # Kafka API (external / host access)
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    command:
+      - redpanda
+      - start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr internal://redpanda:8082,external://localhost:18082
+      - --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr redpanda:33145
+      - --advertise-rpc-addr redpanda:33145
+      - --smp 1           # single core — laptop-friendly
+      - --memory 512M     # cap at 512MB RAM
+      - --default-log-level=warn
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── Redpanda Console (browser UI) ───────────────────────────────────────────
+  console:
+    image: redpandadata/console:latest
+    container_name: olist_redpanda_console
+    networks:
+      - redpanda_net
+    ports:
+      - "8081:8080"       # http://localhost:8081
+    environment:
+      CONFIG_FILEPATH: /etc/redpanda/console-config.yaml
+    volumes:
+      - ./console-config.yaml:/etc/redpanda/console-config.yaml:ro
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  # ── Producer (Python 3.11 — avoids confluent-kafka build issues on 3.14) ────
+  # Not started by "up -d" — only runs when explicitly called via "run --rm"
+  producer:
+    build:
+      context: ./kafka
+      dockerfile: Dockerfile
+    container_name: olist_producer
+    networks:
+      - redpanda_net
+    volumes:
+      - ./data/raw:/data/raw:ro   # CSVs mounted read-only
+    profiles:
+      - tools
+    depends_on:
+      redpanda:
+        condition: service_healthy
