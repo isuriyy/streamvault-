@@ -1,4 +1,4 @@
-# StreamVault — Redpanda stack
+# StreamVault — Redpanda + PySpark stack
 # Isolated on its own network (redpanda_net) — won't touch existing Docker projects.
 #
 # Commands:
@@ -8,8 +8,11 @@
 #   Create topics (run once):
 #     docker compose -f docker-compose.redpanda.yml run --rm producer create_topics.py
 #
-#   Run replay producer:
+#   Run replay producer (in a separate terminal):
 #     docker compose -f docker-compose.redpanda.yml run --rm producer producer.py --data-dir /data/raw --delay 0.05
+#
+#   Run bronze streaming job:
+#     docker compose -f docker-compose.redpanda.yml run --rm spark spark-submit /app/bronze_stream.py
 #
 #   Stop everything:
 #     docker compose -f docker-compose.redpanda.yml down
@@ -33,9 +36,9 @@ services:
     networks:
       - redpanda_net
     ports:
-      - "9092:9092"       # Kafka API (internal)
-      - "9644:9644"       # Admin API → used by Console
-      - "19092:19092"     # Kafka API (external / host access)
+      - "9092:9092"
+      - "9644:9644"
+      - "19092:19092"
     volumes:
       - redpanda_data:/var/lib/redpanda/data
     command:
@@ -48,8 +51,8 @@ services:
       - --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081
       - --rpc-addr redpanda:33145
       - --advertise-rpc-addr redpanda:33145
-      - --smp 1           # single core — laptop-friendly
-      - --memory 512M     # cap at 512MB RAM
+      - --smp 1
+      - --memory 512M
       - --default-log-level=warn
     healthcheck:
       test: ["CMD-SHELL", "rpk cluster health | grep -q healthy"]
@@ -57,14 +60,14 @@ services:
       timeout: 5s
       retries: 10
 
-  # ── Redpanda Console (browser UI) ───────────────────────────────────────────
+  # ── Redpanda Console ─────────────────────────────────────────────────────────
   console:
     image: redpandadata/console:latest
     container_name: olist_redpanda_console
     networks:
       - redpanda_net
     ports:
-      - "8081:8080"       # http://localhost:8081
+      - "8081:8080"
     environment:
       CONFIG_FILEPATH: /etc/redpanda/console-config.yaml
     volumes:
@@ -73,8 +76,7 @@ services:
       redpanda:
         condition: service_healthy
 
-  # ── Producer (Python 3.11 — avoids confluent-kafka build issues on 3.14) ────
-  # Not started by "up -d" — only runs when explicitly called via "run --rm"
+  # ── Producer ─────────────────────────────────────────────────────────────────
   producer:
     build:
       context: ./kafka
@@ -83,9 +85,32 @@ services:
     networks:
       - redpanda_net
     volumes:
-      - ./data/raw:/data/raw:ro   # CSVs mounted read-only
+      - ./data/raw:/data/raw:ro
     profiles:
       - tools
     depends_on:
       redpanda:
         condition: service_healthy
+
+  # ── PySpark (Spark 3.5 + Delta Lake 3.x) ─────────────────────────────────────
+  # Not started by "up -d" — only runs when explicitly called via "run --rm"
+  spark:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: olist_spark
+    networks:
+      - redpanda_net
+    volumes:
+      - ./spark/jobs:/app          # PySpark scripts
+      - ./data/lakehouse:/lakehouse # Delta Lake tables land here
+      - ./data/checkpoints:/checkpoints # Streaming checkpoints
+    profiles:
+      - tools
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      - KAFKA_BROKER=redpanda:9092
+      - LAKEHOUSE_PATH=/lakehouse
+      - CHECKPOINT_PATH=/checkpoints
